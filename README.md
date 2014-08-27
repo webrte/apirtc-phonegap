@@ -163,7 +163,7 @@ function userMediaErrorHandler(e) {
 }
 ```
 
-##### Building for iOS
+##### Building for iOS (optional)
 
     cordova prepare ios
     
