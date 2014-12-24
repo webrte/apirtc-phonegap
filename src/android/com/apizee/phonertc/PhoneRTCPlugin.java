@@ -1,15 +1,16 @@
 package com.apizee.phonertc;
 
-import java.util.LinkedList;
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
+import java.util.Map;
+import java.util.UUID;
 
+import android.app.Activity;
 import android.graphics.Point;
+import android.view.View;
 import android.webkit.WebView;
 
-
-import android.hardware.Camera;
 import org.apache.cordova.CallbackContext;
 import org.apache.cordova.CordovaPlugin;
 import org.apache.cordova.PluginResult;
@@ -17,654 +18,443 @@ import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 import org.webrtc.AudioSource;
-import org.webrtc.DataChannel;
-import org.webrtc.IceCandidate;
+import org.webrtc.AudioTrack;
 import org.webrtc.MediaConstraints;
-import org.webrtc.MediaStream;
-import org.webrtc.MediaStreamTrack;
-import org.webrtc.PeerConnection;
 import org.webrtc.PeerConnectionFactory;
-import org.webrtc.SdpObserver;
-import org.webrtc.SessionDescription;
-import org.webrtc.PeerConnection.IceConnectionState;
-import org.webrtc.PeerConnection.IceGatheringState;
 import org.webrtc.VideoCapturer;
 import org.webrtc.VideoRenderer;
-import org.webrtc.VideoRenderer.I420Frame;
+import org.webrtc.VideoRendererGui;
 import org.webrtc.VideoSource;
 import org.webrtc.VideoTrack;
 
-import android.media.AudioManager;
-import android.util.Log;
-import android.content.pm.ActivityInfo;
-
 public class PhoneRTCPlugin extends CordovaPlugin {
-    public static final String ACTION_CALL = "call";
-    public static final String ACTION_RECEIVE_MESSAGE = "receiveMessage";
-    public static final String ACTION_DISCONNECT = "disconnect";
-    public static final String ACTION_UPDATE_VIDEO_POSITION = "updateVideoPosition";
-    public static final String ACTION_SET_ENABLED_MEDIUM = "setEnabledMedium";
-    public static final String ACTION_UDPATE_ORIENTATION = "updateOrientation";
+	private AudioSource _audioSource;
+	private AudioTrack _audioTrack;
 
-    CallbackContext _callbackContext;
+	private VideoCapturer _videoCapturer;
+	private VideoSource _videoSource;
+	
+	private PeerConnectionFactory _peerConnectionFactory;
+	private Map<String, Session> _sessions;
+	
+	private VideoConfig _videoConfig;
+	private VideoGLView _videoView;
+	private List<VideoTrackRendererPair> _remoteVideos;
+	private VideoTrackRendererPair _localVideo;
+	private WebView.LayoutParams _videoParams;
+	private boolean _shouldDispose = true;
+	private boolean _initializedAndroidGlobals = false;
+	
+	public PhoneRTCPlugin() {
+		_remoteVideos = new ArrayList<VideoTrackRendererPair>();
+		_sessions = new HashMap<String, Session>();
+	}
+	
+	@Override
+	public boolean execute(String action, JSONArray args,
+			CallbackContext callbackContext) throws JSONException {
 
-    private final SDPObserver sdpObserver = new SDPObserver();
-    private final PCObserver pcObserver = new PCObserver();
+		final CallbackContext _callbackContext = callbackContext;
+		
+		if (action.equals("createSessionObject")) {		
+			final SessionConfig config = SessionConfig.fromJSON(args.getJSONObject(1));
+			
+			final String sessionKey = args.getString(0);
+			_callbackContext.sendPluginResult(getSessionKeyPluginResult(sessionKey));
+			
+			cordova.getActivity().runOnUiThread(new Runnable() {
+				public void run() {					
+					if (!_initializedAndroidGlobals) {
+						abortUnless(PeerConnectionFactory.initializeAndroidGlobals(cordova.getActivity(), true, true, 
+								VideoRendererGui.getEGLContext()),
+								"Failed to initializeAndroidGlobals");
+						_initializedAndroidGlobals = true;
+					}
+					
+					if (_peerConnectionFactory == null) {
+						_peerConnectionFactory = new PeerConnectionFactory();
+					}
+					
+					if (config.isAudioStreamEnabled() && _audioTrack == null) {
+						initializeLocalAudioTrack();
+					}
+					
+					if (config.isVideoStreamEnabled() && _localVideo == null) {		
+						initializeLocalVideoTrack();
+					}
+					
+					_sessions.put(sessionKey, new Session(PhoneRTCPlugin.this, 
+							_callbackContext, config, sessionKey));
+					
+					if (_sessions.size() > 1) {
+						_shouldDispose = false;
+					}
+				}
+			});
+			
+			return true;
+		} else if (action.equals("call")) {
+			JSONObject container = args.getJSONObject(0);
+			final String sessionKey = container.getString("sessionKey");
+			
+			cordova.getActivity().runOnUiThread(new Runnable() {
+				public void run() {
+					try {
+						if (_sessions.containsKey(sessionKey)) {
+							_sessions.get(sessionKey).call();
+							_callbackContext.success();
+						} else {
+							_callbackContext.error("No session found matching the key: '" + sessionKey + "'");
+						}
+					} catch(Exception e) {
+						_callbackContext.error(e.getMessage());
+					}
+				}
+			});
+			
+			return true;
+		} else if (action.equals("receiveMessage")) {
+			JSONObject container = args.getJSONObject(0);
+			final String sessionKey = container.getString("sessionKey");
+			final String message = container.getString("message");
 
-    private boolean isInitiator;
+			cordova.getThreadPool().execute(new Runnable() {
+				public void run() {
+					_sessions.get(sessionKey).receiveMessage(message);
+				}
+			});
 
-    private PeerConnectionFactory factory;
-    private PeerConnection pc;
-    private MediaConstraints sdpMediaConstraints;
+			return true;
+		} else if (action.equals("renegotiate")) { 
+			JSONObject container = args.getJSONObject(0);
+			final String sessionKey = container.getString("sessionKey");
+			final SessionConfig config = SessionConfig.fromJSON(container.getJSONObject("config"));	
+			
+			cordova.getActivity().runOnUiThread(new Runnable() {
+				public void run() {
+					Session session = _sessions.get(sessionKey);
+					session.setConfig(config);
+					session.createOrUpdateStream();
+				}
+			});
+			
+		} else if (action.equals("disconnect")) {
+			JSONObject container = args.getJSONObject(0);
+			final String sessionKey = container.getString("sessionKey");
+			
+			cordova.getActivity().runOnUiThread(new Runnable() {
+				@Override
+				public void run() {
+					if (_sessions.containsKey(sessionKey)) {
+						_sessions.get(sessionKey).disconnect(true);
+					}
+				}
+			});
+			
+			return true;
+		} else if (action.equals("setVideoView")) {
+			_videoConfig = VideoConfig.fromJSON(args.getJSONObject(0));
+			
+			// make sure it's not junk
+			if (_videoConfig.getContainer().getWidth() == 0 || _videoConfig.getContainer().getHeight() == 0) {
+				return false;
+			}
+					
+			cordova.getActivity().runOnUiThread(new Runnable() {
+				public void run() {
+					if (!_initializedAndroidGlobals) {
+						abortUnless(PeerConnectionFactory.initializeAndroidGlobals(cordova.getActivity(), true, true, 
+								VideoRendererGui.getEGLContext()),
+								"Failed to initializeAndroidGlobals");
+						_initializedAndroidGlobals = true;
+					}
+					
+					if (_peerConnectionFactory == null) {
+						_peerConnectionFactory = new PeerConnectionFactory();
+					}
 
-    private LinkedList<IceCandidate> queuedRemoteCandidates ;
+					_videoParams = new WebView.LayoutParams(
+							_videoConfig.getContainer().getWidth() * _videoConfig.getDevicePixelRatio(), 
+							_videoConfig.getContainer().getHeight() * _videoConfig.getDevicePixelRatio(), 
+							_videoConfig.getContainer().getX() * _videoConfig.getDevicePixelRatio(), 
+							_videoConfig.getContainer().getY() * _videoConfig.getDevicePixelRatio());
+				
+					if (_videoView == null) {
+						// createVideoView();
+						
+						if (_videoConfig.getLocal() != null && _localVideo == null) {
+							initializeLocalVideoTrack();
+						}
+					} else {						
+						_videoView.setLayoutParams(_videoParams);
+					}
+				}
+			});
+			
+			return true;
+		} else if (action.equals("hideVideoView")) {
+			cordova.getActivity().runOnUiThread(new Runnable() {
+				public void run() {
+					_videoView.setVisibility(View.GONE);
+				}
+			});
+		} else if (action.equals("showVideoView")) {
+			cordova.getActivity().runOnUiThread(new Runnable() {
+				public void run() {
+					_videoView.setVisibility(View.VISIBLE);
+				}
+			});		
+		}
 
-    private MediaStream localStream;
-    private MediaStream remoteStream;
+		callbackContext.error("Invalid action: " + action);
+		return false;
+	}
 
-    // Synchronize on quit[0] to avoid teardown-related crashes.
-    private final Boolean[] quit = new Boolean[] { false };
+	void initializeLocalVideoTrack() {
+		_videoCapturer = getVideoCapturer();
+		_videoSource = _peerConnectionFactory.createVideoSource(_videoCapturer, 
+				new MediaConstraints());
+		_localVideo = new VideoTrackRendererPair(_peerConnectionFactory.createVideoTrack("ARDAMSv0", _videoSource), null);
+		refreshVideoView(); 
+	}
+	
+	int getPercentage(int localValue, int containerValue) {
+		return (int)(localValue * 100.0 / containerValue);
+	}
+	
+	void initializeLocalAudioTrack() {
+		_audioSource = _peerConnectionFactory.createAudioSource(new MediaConstraints());
+		_audioTrack = _peerConnectionFactory.createAudioTrack("ARDAMSa0", _audioSource);
+	}
+	
+	public VideoTrack getLocalVideoTrack() {
+		if (_localVideo == null) {
+			return null;
+		}
+		
+		return _localVideo.getVideoTrack();
+	}
+	
+	public AudioTrack getLocalAudioTrack() {
+		return _audioTrack;
+	}
+	
+	public PeerConnectionFactory getPeerConnectionFactory() {
+		return _peerConnectionFactory;
+	}
+	
+	public Activity getActivity() {
+		return cordova.getActivity();
+	}
+	
+	public WebView getWebView() {
+		return this.getWebView();
+	}
+	
+	public VideoConfig getVideoConfig() {
+		return this._videoConfig;
+	}
+	
+	private static void abortUnless(boolean condition, String msg) {
+		if (!condition) {
+			throw new RuntimeException(msg);
+		}
+	}
 
-    private AudioSource audioSource;
+	// Cycle through likely device names for the camera and return the first
+	// capturer that works, or crash if none do.
+	private VideoCapturer getVideoCapturer() {
+		String[] cameraFacing = { "front", "back" };
+		int[] cameraIndex = { 0, 1 };
+		int[] cameraOrientation = { 0, 90, 180, 270 };
+		for (String facing : cameraFacing) {
+			for (int index : cameraIndex) {
+				for (int orientation : cameraOrientation) {
+					String name = "Camera " + index + ", Facing " + facing +
+						", Orientation " + orientation;
+					VideoCapturer capturer = VideoCapturer.create(name);
+					if (capturer != null) {
+						// logAndToast("Using camera: " + name);
+						return capturer;
+					}
+				}
+			}
+		}
+		throw new RuntimeException("Failed to open capturer");
+	}
+	
+	public void addRemoteVideoTrack(VideoTrack videoTrack) {
+		_remoteVideos.add(new VideoTrackRendererPair(videoTrack, null));
+		refreshVideoView();
+	}
 
-    private VideoCapturer videoCapturer;
-    private VideoSource videoSource;
-    private VideoStreamsView localVideoView;
-    private VideoStreamsView remoteVideoView;
+	public void removeRemoteVideoTrack(VideoTrack videoTrack) {
+		for (VideoTrackRendererPair pair : _remoteVideos) { 
+			if (pair.getVideoTrack() == videoTrack) {
+				if (pair.getVideoRenderer() != null) {
+					pair.getVideoTrack().removeRenderer(pair.getVideoRenderer());
+					pair.setVideoRenderer(null);
+				}
+				
+				pair.setVideoTrack(null);
+				
+				_remoteVideos.remove(pair);
+				refreshVideoView();
+				return;
+			}
+		}
+	}
+	
+	private void createVideoView() {
+		Point size = new Point();
+		size.set(_videoConfig.getContainer().getWidth() * _videoConfig.getDevicePixelRatio(), 
+				_videoConfig.getContainer().getHeight() * _videoConfig.getDevicePixelRatio());
 
-    @Override
-    public boolean execute(String action, JSONArray args,
-                           CallbackContext callbackContext) throws JSONException {
+		_videoView = new VideoGLView(cordova.getActivity(), size);
+		VideoRendererGui.setView(_videoView);
+	
+		webView.addView(_videoView, _videoParams);
+	}
+	
+	private void refreshVideoView() {
+		int n = _remoteVideos.size();
+		
+		for (VideoTrackRendererPair pair : _remoteVideos) {
+			if (pair.getVideoRenderer() != null) {
+				pair.getVideoTrack().removeRenderer(pair.getVideoRenderer());
+			}
+			
+			pair.setVideoRenderer(null);
+		}
+		
+		if (_localVideo != null && _localVideo.getVideoRenderer() != null) {
+			_localVideo.getVideoTrack().removeRenderer(_localVideo.getVideoRenderer());
+			_localVideo.setVideoRenderer(null);
+		}
+		
+		if (_videoView != null) {
+			webView.removeView(_videoView);
+			_videoView = null;
+		}
+		
+		if (n > 0) {	
+			createVideoView();
+			
+			int rows = n < 9 ? 2 : 3;
+			int videosInRow = n == 2 ? 2 : (int)Math.ceil((float)n / rows);
+			
+			int videoSize = (int)((float)_videoConfig.getContainer().getWidth() / videosInRow);
+			int actualRows = (int)Math.ceil((float)n / videosInRow);
+			
+			int y = getCenter(actualRows, videoSize, _videoConfig.getContainer().getHeight());
+			
+			int videoIndex = 0;
+			int videoSizeAsPercentage = getPercentage(videoSize, _videoConfig.getContainer().getWidth());
+			
+			for (int row = 0; row < rows && videoIndex < n; row++) {
+				int x = getCenter(row < row - 1 || n % rows == 0 ? 
+									videosInRow : n - (Math.min(n, videoIndex + videosInRow) - 1),
+								videoSize,
+								_videoConfig.getContainer().getWidth());
+				
+				for (int video = 0; video < videosInRow && videoIndex < n; video++) {
+					VideoTrackRendererPair pair = _remoteVideos.get(videoIndex++);
 
-        if (action.equals(ACTION_CALL)) {
-            isInitiator = args.getBoolean(0);
+					pair.setVideoRenderer(new VideoRenderer(
+							VideoRendererGui.create(x, y, videoSizeAsPercentage, videoSizeAsPercentage, 
+									VideoRendererGui.ScalingType.SCALE_FILL, true)));
+				
+					pair.getVideoTrack().addRenderer(pair.getVideoRenderer());
+					
+					x += videoSizeAsPercentage;
+				}
+				
+				y += getPercentage(videoSize, _videoConfig.getContainer().getHeight());
+			}
+			
+			if (_videoConfig.getLocal() != null && _localVideo != null) {
+				_localVideo.getVideoTrack().addRenderer(new VideoRenderer(
+						VideoRendererGui.create(getPercentage(_videoConfig.getLocal().getX(), _videoConfig.getContainer().getWidth()), 
+												getPercentage(_videoConfig.getLocal().getY(), _videoConfig.getContainer().getHeight()), 
+												getPercentage(_videoConfig.getLocal().getWidth(), _videoConfig.getContainer().getWidth()), 
+												getPercentage(_videoConfig.getLocal().getHeight(), _videoConfig.getContainer().getHeight()), 
+												VideoRendererGui.ScalingType.SCALE_FILL,
+												true)));
+				
+			}
+		}
+	}
+	
+	int getCenter(int videoCount, int videoSize, int containerSize) {
+		return getPercentage((int)Math.round((containerSize - videoSize * videoCount) / 2.0), containerSize);
+	}
+	
+	PluginResult getSessionKeyPluginResult(String sessionKey) throws JSONException {
+		JSONObject json = new JSONObject();
+		json.put("type", "__set_session_key");
+		json.put("sessionKey", sessionKey);
+		
+		PluginResult result = new PluginResult(PluginResult.Status.OK, json);
+		result.setKeepCallback(true);
+		
+		return result;
+	}
+	
+	public void onSessionDisconnect(String sessionKey) {
+		_sessions.remove(sessionKey);
 
-            final String turnServerHost = args.getString(1);
-            final String turnUsername = args.getString(2);
-            final String turnPassword = args.getString(3);
-            final JSONObject video = (!args.isNull(4)) ? args.getJSONObject(4) : null;
+		
+		if (_sessions.size() == 0) {
+			cordova.getActivity().runOnUiThread(new Runnable() {
+				public void run() {
+					if (_localVideo != null ) {
+						if (_localVideo.getVideoTrack() != null && _localVideo.getVideoRenderer() != null) {
+							_localVideo.getVideoTrack().removeRenderer(_localVideo.getVideoRenderer());
+						}
+						
+						_localVideo = null;	
+					}
+			
+					if (_videoView != null) {
+						_videoView.setVisibility(View.GONE);
+						webView.removeView(_videoView);
+					}
 
-            _callbackContext = callbackContext;
-            queuedRemoteCandidates = new LinkedList<IceCandidate>();
-            quit[0] = false;
-
-            cordova.getThreadPool().execute(new Runnable() {
-                public void run() {
-                    PluginResult result = new PluginResult(PluginResult.Status.NO_RESULT);
-                    result.setKeepCallback(true);
-                    _callbackContext.sendPluginResult(result);
-
-                    AudioManager audioManager = ((AudioManager) cordova.getActivity().getSystemService(cordova.getActivity().AUDIO_SERVICE));
-                    @SuppressWarnings("deprecation")
-                    boolean isWiredHeadsetOn = audioManager.isWiredHeadsetOn();
-                    //audioManager.setMode(isWiredHeadsetOn ? AudioManager.MODE_IN_CALL
-                    //		: AudioManager.MODE_IN_COMMUNICATION);
-                    audioManager.setSpeakerphoneOn(!isWiredHeadsetOn);
-                    audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC), 0);
-
-                    abortUnless(PeerConnectionFactory.initializeAndroidGlobals(cordova.getActivity(), true, true),
-                                "Failed to initializeAndroidGlobals");
-
-                    final LinkedList<PeerConnection.IceServer> iceServers = new LinkedList<PeerConnection.IceServer>();
-                    iceServers.add(new PeerConnection.IceServer(
-                        "stun:stun.l.google.com:19302"));
-                    iceServers.add(new PeerConnection.IceServer(
-                        turnServerHost, turnUsername, turnPassword));
-
-                    sdpMediaConstraints = new MediaConstraints();
-                    sdpMediaConstraints.mandatory.add(new MediaConstraints.KeyValuePair(
-                        "OfferToReceiveAudio", "true"));
-                    sdpMediaConstraints.mandatory.add(new MediaConstraints.KeyValuePair(
-                        "OfferToReceiveVideo", (video != null) ? "true" : "false"));
-
-                    cordova.getActivity().runOnUiThread(new Runnable() {
-                        public void run() {
-                            factory = new PeerConnectionFactory();
-                            MediaConstraints pcMediaConstraints = new MediaConstraints();
-                            pcMediaConstraints.mandatory.add(new MediaConstraints.KeyValuePair("maxHeight", "240"));
-                            pcMediaConstraints.mandatory.add(new MediaConstraints.KeyValuePair("maxWidth", "320"));
-                            pcMediaConstraints.mandatory.add(new MediaConstraints.KeyValuePair("minFrameRate", "15"));
-                            pcMediaConstraints.mandatory.add(new MediaConstraints.KeyValuePair("maxFrameRate", "20"));
-                            pcMediaConstraints.optional.add(new MediaConstraints.KeyValuePair(
-                                "DtlsSrtpKeyAgreement", "true"));
-                            pc = factory.createPeerConnection(iceServers, pcMediaConstraints,
-                                                              pcObserver);
-
-                            localStream = factory.createLocalMediaStream("ARDAMS");
-
-                            if (video != null) {
-                                try {
-                                    localVideoView = createVideoView(video.getJSONObject("localVideo"));
-                                    remoteVideoView = createVideoView(video.getJSONObject("remoteVideo"));
-
-                                    VideoCapturer capturer = getVideoCapturer();
-                                    videoSource = factory.createVideoSource(capturer, new MediaConstraints());
-                                    VideoTrack videoTrack =
-                                        factory.createVideoTrack("ARDAMSv0", videoSource);
-                                    videoTrack.addRenderer(new VideoRenderer(new VideoCallbacks(
-                                        localVideoView, VideoStreamsView.Endpoint.REMOTE)));
-                                    localStream.addTrack(videoTrack);
-                                } catch (JSONException e) {
-                                    Log.e("com.dooble.phonertc", "A JSON exception has occured while trying to add video.", e);
-                                }
-                            }
-
-                            audioSource = factory.createAudioSource(new MediaConstraints());
-                            localStream.addTrack(factory.createAudioTrack("ARDAMSa0", audioSource));
-                            pc.addStream(localStream, new MediaConstraints());
-
-                            if (isInitiator) {
-                                pc.createOffer(sdpObserver, sdpMediaConstraints);
-                            }
-
-                            try {
-                                JSONObject json = new JSONObject();
-                                json.put("type", "__ready");
-                                sendMessage(json);
-                            } catch (JSONException e) {
-                                // TODO Auto-generated catch bloc
-                                e.printStackTrace();
-                            }
-
-                        }
-                    });
-                }
-            });
-
-            return true;
-        } else if (action.equals(ACTION_RECEIVE_MESSAGE)) {
-            final String message = args.getString(0);
-
-            cordova.getThreadPool().execute(new Runnable() {
-                public void run() {
-                    try {
-                        JSONObject json = new JSONObject(message);
-                        String type = (String) json.get("type");
-                        if (type.equals("candidate")) {
-                            final IceCandidate candidate = new IceCandidate(
-                                (String) json.get("id"), json.getInt("label"),
-                                (String) json.get("candidate"));
-                            if (queuedRemoteCandidates != null) {
-                                queuedRemoteCandidates.add(candidate);
-                            } else {
-                                cordova.getActivity().runOnUiThread(new Runnable() {
-                                    public void run() {
-                                        pc.addIceCandidate(candidate);
-                                    }
-                                });
-                            }
-                        } else if (type.equals("answer") || type.equals("offer")) {
-                            final SessionDescription sdp = new SessionDescription(
-                                SessionDescription.Type.fromCanonicalForm(type),
-                                preferISAC((String) json.get("sdp")));
-                            cordova.getActivity().runOnUiThread(new Runnable() {
-                                public void run() {
-                                    pc.setRemoteDescription(sdpObserver, sdp);
-                                }
-                            });
-                        } else if (type.equals("bye")) {
-                            Log.d("com.dooble.phonertc", "Remote end hung up; dropping PeerConnection");
-
-                            cordova.getActivity().runOnUiThread(new Runnable() {
-                                public void run() {
-                                    disconnect();
-                                }
-                            });
-                        } else {
-                            //throw new RuntimeException("Unexpected message: " + message);
-                        }
-                    } catch (JSONException e) {
-                        throw new RuntimeException(e);
+					if (_videoSource != null) {
+						if (_shouldDispose) {
+							_videoSource.dispose();
+						} else {
+							_videoSource.stop();
+						}
+						
+						_videoSource = null;
+					}
+					
+					if (_videoCapturer != null) {
+						_videoCapturer.dispose();
+						_videoCapturer = null;
+					}
+                    
+                    if (_audioSource != null) {
+                        _audioSource.dispose();
+                        _audioSource = null;
+                        
+                        _audioTrack = null;
                     }
-                }
-            });
-
-            return true;
-        } else if (action.equals(ACTION_DISCONNECT)) {
-            Log.e("com.dooble.phonertc", "DISCONNECT");
-            disconnect();
-        } else if (action.equals(ACTION_UPDATE_VIDEO_POSITION)) {
-            final JSONObject videoElements = args.getJSONObject(0);
-            cordova.getActivity().runOnUiThread(new Runnable() {
-                public void run () {
-                    try {
-                        WebView.LayoutParams params;
-                        if (localVideoView != null && videoElements.has("localVideo")) {
-                            params=getLayoutParams(videoElements.getJSONObject("localVideo"));
-                            localVideoView.setLayoutParams(params);
-                            localVideoView.updateSize(new Point(params.width, params.height));
-                        }
-                        if (remoteVideoView != null && videoElements.has("remoteVideo")) {
-                            params= getLayoutParams(videoElements.getJSONObject("remoteVideo"));
-                            remoteVideoView.setLayoutParams(params);
-                            remoteVideoView.updateSize(new Point(params.width, params.height));
-                        }
-                    } catch (JSONException e) {
-                        throw new RuntimeException(e);
-                    }
-                }
-            });
-        } else if (action.equals(ACTION_SET_ENABLED_MEDIUM)) {
-            String mediumType = args.getString(0);
-            Boolean enabled = args.getBoolean(1);
-            setEnabledMedium(mediumType, enabled);
-        }
-        else if (action.equals(ACTION_UDPATE_ORIENTATION)) {
-            String orientation = args.getString(0);
-            if("landscape".equals(orientation))
-            {
-                cordova.getActivity().setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE);
-            }
-            else
-            {
-                cordova.getActivity().setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_PORTRAIT);
-            }
-        }
-
-        callbackContext.error("Invalid action");
-        return false;
-    }
-
-    private void setEnabledMedium (String mediumType, final boolean enabled) {
-        setEnabledStream(localStream, mediumType, enabled);
-        setEnabledStream(remoteStream, mediumType, enabled);
-
-        if ("video".equals(mediumType)) {
-            cordova.getActivity().runOnUiThread(new Runnable() {
-                public void run () {
-                    if (enabled) {
-                        localVideoView.setVisibility(WebView.VISIBLE);
-                        remoteVideoView.setVisibility(WebView.VISIBLE);
-                    } else {
-                        localVideoView.setVisibility(WebView.GONE);
-                        remoteVideoView.setVisibility(WebView.GONE);
-                    }
-                }
-            });
-        }
-    }
-
-    private void setEnabledStream (MediaStream stream, String mediumType,
-                                   boolean enabled) {
-        if (stream == null) {
-            return;
-        }
-
-        if ("audio".equals(mediumType)) {
-            setEnabledTracks(stream.audioTracks, enabled);
-        } else if ("video".equals(mediumType)) {
-            setEnabledTracks(stream.videoTracks, enabled);
-        }
-    }
-
-    private void setEnabledTracks (List<? extends MediaStreamTrack> tracks,
-                                   boolean enabled) {
-        for (MediaStreamTrack track : tracks) {
-            track.setEnabled(enabled);
-        }
-    }
-
-    WebView.LayoutParams getLayoutParams (JSONObject config) throws JSONException {
-        int devicePixelRatio = config.getInt("devicePixelRatio");
-
-        int width = config.getInt("width") * devicePixelRatio;
-        int height = config.getInt("height") * devicePixelRatio;
-        int x = config.getInt("x") * devicePixelRatio;
-        int y = config.getInt("y") * devicePixelRatio;
-
-        WebView.LayoutParams params = new WebView.LayoutParams(width, height, x, y);
-
-        return params;
-    }
-
-    VideoStreamsView createVideoView(JSONObject config) throws JSONException {
-        WebView.LayoutParams params = getLayoutParams(config);
-
-        Point displaySize = new Point(params.width, params.height);
-
-        VideoStreamsView view = new VideoStreamsView(cordova.getActivity(), displaySize);
-        webView.addView(view, params);
-
-        return view;
-    }
-
-    void sendMessage(JSONObject data) {
-        PluginResult result = new PluginResult(PluginResult.Status.OK, data);
-        result.setKeepCallback(true);
-        _callbackContext.sendPluginResult(result);
-    }
-
-    private String preferISAC(String sdpDescription) {
-        String[] lines = sdpDescription.split("\r?\n");
-        int mLineIndex = -1;
-        String isac16kRtpMap = null;
-        Pattern isac16kPattern = Pattern
-            .compile("^a=rtpmap:(\\d+) ISAC/16000[\r]?$");
-        for (int i = 0; (i < lines.length)
-             && (mLineIndex == -1 || isac16kRtpMap == null); ++i) {
-            if (lines[i].startsWith("m=audio ")) {
-                mLineIndex = i;
-                continue;
-            }
-            Matcher isac16kMatcher = isac16kPattern.matcher(lines[i]);
-            if (isac16kMatcher.matches()) {
-                isac16kRtpMap = isac16kMatcher.group(1);
-                continue;
-            }
-        }
-        if (mLineIndex == -1) {
-            Log.d("com.dooble.phonertc",
-                  "No m=audio line, so can't prefer iSAC");
-            return sdpDescription;
-        }
-        if (isac16kRtpMap == null) {
-            Log.d("com.dooble.phonertc",
-                  "No ISAC/16000 line, so can't prefer iSAC");
-            return sdpDescription;
-        }
-        String[] origMLineParts = lines[mLineIndex].split(" ");
-        StringBuilder newMLine = new StringBuilder();
-        int origPartIndex = 0;
-        // Format is: m=<media> <port> <proto> <fmt> ...
-        newMLine.append(origMLineParts[origPartIndex++]).append(" ");
-        newMLine.append(origMLineParts[origPartIndex++]).append(" ");
-        newMLine.append(origMLineParts[origPartIndex++]).append(" ");
-        newMLine.append(isac16kRtpMap).append(" ");
-        for (; origPartIndex < origMLineParts.length; ++origPartIndex) {
-            if (!origMLineParts[origPartIndex].equals(isac16kRtpMap)) {
-                newMLine.append(origMLineParts[origPartIndex]).append(" ");
-            }
-        }
-        lines[mLineIndex] = newMLine.toString();
-        StringBuilder newSdpDescription = new StringBuilder();
-        for (String line : lines) {
-            newSdpDescription.append(line).append("\r\n");
-        }
-        return newSdpDescription.toString();
-    }
-
-    private static void abortUnless(boolean condition, String msg) {
-        if (!condition) {
-            throw new RuntimeException(msg);
-        }
-    }
-
-    // Cycle through likely device names for the camera and return the first
-    // capturer that works, or crash if none do.
-    private VideoCapturer getVideoCapturer() {
-        if (videoCapturer != null) {
-            return videoCapturer;
-        }
-        String[] cameraFacing = { "front", "back" };
-        int[] cameraIndex = { 0, 1 };
-        int[] cameraOrientation = { 0, 90, 180, 270 };
-        for (String facing : cameraFacing) {
-            for (int index : cameraIndex) {
-                for (int orientation : cameraOrientation) {
-                    String name = "Camera " + index + ", Facing " + facing +
-                        ", Orientation " + orientation;
-                    VideoCapturer capturer = VideoCapturer.create(name);
-                    if (capturer != null) {
-                        // logAndToast("Using camera: " + name);
-                        return capturer;
-                    }
-                }
-            }
-        }
-        throw new RuntimeException("Failed to open capturer");
-    }
-
-    private class PCObserver implements PeerConnection.Observer {
-
-        @Override
-        public void onIceCandidate(final IceCandidate iceCandidate) {
-            PhoneRTCPlugin.this.cordova.getActivity().runOnUiThread(new Runnable() {
-                public void run() {
-                    try {
-                        JSONObject json = new JSONObject();
-                        json.put("type", "candidate");
-                        json.put("label", iceCandidate.sdpMLineIndex);
-                        json.put("id", iceCandidate.sdpMid);
-                        json.put("candidate", iceCandidate.sdp);
-                        sendMessage(json);
-                    } catch (JSONException e) {
-                        // TODO Auto-generated catch bloc
-                        e.printStackTrace();
-                    }
-                }
-            });
-        }
-
-        @Override
-        public void onAddStream(final MediaStream stream) {
-            remoteStream = stream;
-            PhoneRTCPlugin.this.cordova.getActivity().runOnUiThread(new Runnable() {
-                public void run() {
-                    if (remoteVideoView != null) {
-                        stream.videoTracks.get(0).addRenderer(new VideoRenderer(
-                            new VideoCallbacks(remoteVideoView, VideoStreamsView.Endpoint.REMOTE)));
-                    }
-
-                    try {
-                        JSONObject data = new JSONObject();
-                        data.put("type", "__answered");
-                        sendMessage(data);
-                    } catch (JSONException e) {
-
-                    }
-                }
-            });
-        }
-
-        @Override
-        public void onDataChannel(DataChannel stream) {
-            // TODO Auto-generated method stub
-
-        }
-
-        @Override
-        public void onError() {
-            // TODO Auto-generated method stub
-
-        }
-
-        @Override
-        public void onIceConnectionChange(IceConnectionState arg0) {
-            // TODO Auto-generated method stub
-
-        }
-
-        @Override
-        public void onIceGatheringChange(IceGatheringState arg0) {
-            // TODO Auto-generated method stub
-
-        }
-
-        @Override
-        public void onRemoveStream(MediaStream arg0) {
-            // TODO Auto-generated method stub
-
-        }
-
-        @Override
-        public void onRenegotiationNeeded() {
-            // TODO Auto-generated method stub
-
-        }
-
-        @Override
-        public void onSignalingChange(
-            PeerConnection.SignalingState signalingState) {
-
-        }
-
-    }
-
-    private class SDPObserver implements SdpObserver {
-        @Override
-        public void onCreateSuccess(final SessionDescription origSdp) {
-            PhoneRTCPlugin.this.cordova.getActivity().runOnUiThread(new Runnable() {
-                public void run() {
-                    SessionDescription sdp = new SessionDescription(
-                        origSdp.type, preferISAC(origSdp.description));
-                    try {
-                        JSONObject json = new JSONObject();
-                        json.put("type", sdp.type.canonicalForm());
-                        json.put("sdp", sdp.description);
-                        sendMessage(json);
-                        pc.setLocalDescription(sdpObserver, sdp);
-                    } catch (JSONException e) {
-                        // TODO Auto-generated catch block
-                        e.printStackTrace();
-                    }
-                }
-            });
-        }
-
-        @Override
-        public void onSetSuccess() {
-            PhoneRTCPlugin.this.cordova.getActivity().runOnUiThread(new Runnable() {
-                public void run() {
-                    if (isInitiator) {
-                        if (pc.getRemoteDescription() != null) {
-                            // We've set our local offer and received & set the
-                            // remote
-                            // answer, so drain candidates.
-                            drainRemoteCandidates();
-                        }
-                    } else {
-                        if (pc.getLocalDescription() == null) {
-                            // We just set the remote offer, time to create our
-                            // answer.
-                            pc.createAnswer(SDPObserver.this,
-                                            sdpMediaConstraints);
-                        } else {
-                            // Sent our answer and set it as local description;
-                            // drain
-                            // candidates.
-                            drainRemoteCandidates();
-                        }
-                    }
-                }
-            });
-        }
-
-        @Override
-        public void onCreateFailure(final String error) {
-            PhoneRTCPlugin.this.cordova.getActivity().runOnUiThread(new Runnable() {
-                public void run() {
-                    throw new RuntimeException("createSDP error: " + error);
-                }
-            });
-        }
-
-        @Override
-        public void onSetFailure(final String error) {
-            PhoneRTCPlugin.this.cordova.getActivity().runOnUiThread(new Runnable() {
-                public void run() {
-                    //throw new RuntimeException("setSDP error: " + error);
-                }
-            });
-        }
-
-        private void drainRemoteCandidates() {
-            try
-            {
-                if (queuedRemoteCandidates == null)
-                    return;
-
-                for (IceCandidate candidate : queuedRemoteCandidates) {
-                    pc.addIceCandidate(candidate);
-                }
-                queuedRemoteCandidates = null;
-            }
-            catch(Exception e)
-            {
-
-            }
-        }
-    }
-
-    private void disconnect() {
-        synchronized (quit[0]) {
-            if (quit[0]) {
-                return;
-            }
-            quit[0] = true;
-            if (pc != null) {
-                pc.dispose();
-                pc = null;
-            }
-
-            try {
-                JSONObject json = new JSONObject();
-                json.put("type", "bye");
-                sendMessage(json);
-            } catch (JSONException e) {
-                // TODO Auto-generated catch block
-                e.printStackTrace();
-            }
-
-            cordova.getActivity().runOnUiThread(new Runnable() {
-                public void run() {
-                    if (localVideoView != null) {
-                        webView.removeView(localVideoView);
-                        localVideoView = null;
-                    }
-
-                    if (remoteVideoView != null) {
-                        webView.removeView(remoteVideoView);
-                        remoteVideoView = null;
-                    }
-                }
-            });
-
-            if (videoSource != null) {
-                videoSource.dispose();
-                videoSource = null;
-            }
-
-            if (factory != null) {
-                factory.dispose();
-                factory = null;
-            }
-        }
-
-        try {
-            JSONObject data = new JSONObject();
-            data.put("type", "__disconnected");
-            sendMessage(data);
-        } catch (JSONException e) {
-
-        }
-    }
-
-    // Implementation detail: bridge the VideoRenderer.Callbacks interface to the
-    // VideoStreamsView implementation.
-    private class VideoCallbacks implements VideoRenderer.Callbacks {
-        private final VideoStreamsView view;
-        private final VideoStreamsView.Endpoint stream;
-
-        public VideoCallbacks(
-            VideoStreamsView view, VideoStreamsView.Endpoint stream) {
-            this.view = view;
-            this.stream = stream;
-            Log.d("CordovaLog", "VideoCallbacks");
-        }
-
-        @Override
-        public void setSize(final int width, final int height) {
-            Log.d("setSize", width + " " + height);
-            view.queueEvent(new Runnable() {
-                public void run() {
-                    view.setSize(stream, width, height);
-                }
-            });
-        }
-
-        @Override
-        public void renderFrame(I420Frame frame) {
-            view.queueFrame(stream, frame);
-        }
-    }
+                    
+					// if (_peerConnectionFactory != null) {
+					// 	_peerConnectionFactory.dispose();
+					// 	_peerConnectionFactory = null;
+					// }
+					
+					_remoteVideos.clear();
+					_shouldDispose = true;
+				}
+			});
+		}
+	} 
+	
+	public boolean shouldDispose() {
+		return _shouldDispose;
+	}
 }
